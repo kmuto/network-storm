@@ -1,116 +1,158 @@
 package main
 
 import (
+	"encoding/csv"
 	"flag"
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gosnmp/gosnmp"
 	"golang.org/x/net/ipv4"
 )
 
-const (
-	ListenAddr     = "0.0.0.0:1611"
-	InterfaceCount = 8 // テストしたいIF数
-)
-
+// ulimit -n 2048
 // snmpbulkget -v2c -c public -Cn0 -Cr18 127.0.0.1:1611 .1.3.6.1.2.1.2.2.1.10
+
+// アドレスごとの設定構造体
+type AgentConfig struct {
+	IP      string
+	IfCount int
+	DelayMs int
+}
 
 func main() {
 	port := flag.Int("port", 1611, "UDP port to listen on")
-	ifCount := flag.Int("if", 8, "Number of interfaces to simulate")
-	delayMs := flag.Int("delay", 0, "Artificial delay in milliseconds before responding (negative value to simulate failure/silent)")
+	csvPath := flag.String("csv", "config.csv", "Path to the configuration CSV file")
 	flag.Parse()
 
-	ListenAddr := fmt.Sprintf("0.0.0.0:%d", *port)
-	conn, err := net.ListenPacket("udp", ListenAddr)
+	configs, err := loadConfig(*csvPath)
 	if err != nil {
-		log.Fatalf("Error: %v", err)
-	}
-	defer conn.Close()
-
-	pc := ipv4.NewPacketConn(conn)
-	if err := pc.SetControlMessage(ipv4.FlagDst, true); err != nil {
-		log.Fatalf("Error setting control message: %v", err)
+		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	fmt.Printf("SNMP Bulk Responder running on %s (Logging Destination IP)...\n", ListenAddr)
-	fmt.Printf("Settings: Interfaces=%d, Delay=%dms\n", *ifCount, *delayMs)
-	if *delayMs < 0 {
-		fmt.Println("Simulating failure mode: No responses will be sent.")
+	var wg sync.WaitGroup
+	for _, cfg := range configs {
+		wg.Add(1)
+		go func(cfg AgentConfig) {
+			defer wg.Done()
+			runAgent(cfg, *port)
+		}(cfg)
 	}
 
+	fmt.Printf(">> Successfully initialized %d agents on port %d\n", len(configs), *port)
+	wg.Wait()
+}
+
+func runAgent(cfg AgentConfig, port int) {
+	listenAddr := fmt.Sprintf("%s:%d", cfg.IP, port)
+	// パケットコネクションの作成
+	lc, err := net.ListenPacket("udp", listenAddr)
+	if err != nil {
+		log.Printf("![%s] Bind Error: %v", cfg.IP, err)
+		return
+	}
+	defer lc.Close()
+
+	// 宛先IP取得用の設定
+	pc := ipv4.NewPacketConn(lc)
+	_ = pc.SetControlMessage(ipv4.FlagDst, true)
+	log.Printf("[%s] Active (IFs: %d, Delay: %dms)", cfg.IP, cfg.IfCount, cfg.DelayMs)
 	buf := make([]byte, 4096)
 	for {
 		n, cm, srcAddr, err := pc.ReadFrom(buf)
 		if err != nil {
-			log.Printf("Read error: %v", err)
+			log.Printf("[%s] Read error: %v", cfg.IP, err)
 			continue
 		}
 
-		dstIP := "Unknown"
-		if cm != nil {
-			dstIP = cm.Dst.String()
-		}
-
-		// 受信データをデコード
+		// パケットデコード
 		packet, err := gosnmp.Default.SnmpDecodePacket(buf[:n])
 		if err != nil {
-			log.Printf("Decode error: %v", err)
 			continue
 		}
 
-		// GetBulkRequest以外は無視
-		if packet.PDUType != gosnmp.GetBulkRequest {
-			continue
-		}
+		// GetBulkRequestに対する処理
+		if packet.PDUType == gosnmp.GetBulkRequest {
+			// 1. 障害シミュレーション (delay < 0)
+			if cfg.DelayMs < 0 {
+				log.Printf("[%s] DROP Request from %s (Failure Mode)", cfg.IP, srcAddr)
+				continue
+			}
 
-		log.Printf("[Bulk Request] From: %s -> To: %s | Community: %s", srcAddr, dstIP, packet.Community)
-		if *delayMs < 0 {
-			log.Printf("   >> Failure mode: dropping request from %s", srcAddr)
-			continue // 負値の場合は何も返さずループの先頭に戻る
-		}
+			// 2. 遅延シミュレーション
+			if cfg.DelayMs > 0 {
+				time.Sleep(time.Duration(cfg.DelayMs) * time.Millisecond)
+			}
 
-		if *delayMs > 0 {
-			time.Sleep(time.Duration(*delayMs) * time.Millisecond)
-		}
+			// 3. レスポンス生成・送信
+			dstIP := cfg.IP
+			if cm != nil {
+				dstIP = cm.Dst.String()
+			}
 
-		// レスポンスの構築
-		response := &gosnmp.SnmpPacket{
-			Version:   packet.Version,
-			Community: packet.Community,
-			PDUType:   gosnmp.GetResponse,
-			RequestID: packet.RequestID,
-			Error:     gosnmp.NoError,
-			Variables: generateIfMetrics(*ifCount),
-		}
+			response := &gosnmp.SnmpPacket{
+				Version:   packet.Version,
+				Community: packet.Community,
+				PDUType:   gosnmp.GetResponse,
+				RequestID: packet.RequestID,
+				Variables: generateIfMetrics(cfg.IfCount),
+			}
 
-		out, err := response.MarshalMsg()
-		if err != nil {
-			log.Printf("Marshal error: %v", err)
-			continue
+			out, _ := response.MarshalMsg()
+			_, err = lc.WriteTo(out, srcAddr)
+
+			if err == nil {
+				log.Printf("[%s] SENT Response to %s", dstIP, srcAddr)
+			}
 		}
-		conn.WriteTo(out, srcAddr)
 	}
 }
 
-// 6つのメトリクス (In/Out x Octets/Errors/Discards) を生成
+func loadConfig(path string) ([]AgentConfig, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	reader := csv.NewReader(f)
+	records, err := reader.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	var configs []AgentConfig
+	for i, r := range records {
+		if i == 0 || len(r) < 3 { // ヘッダー飛ばし & 列数チェック
+			continue
+		}
+
+		ifCnt, _ := strconv.Atoi(r[1])
+		delay, _ := strconv.Atoi(r[2])
+
+		configs = append(configs, AgentConfig{
+			IP: r[0], IfCount: ifCnt, DelayMs: delay,
+		})
+	}
+	return configs, nil
+}
+
 func generateIfMetrics(count int) []gosnmp.SnmpPDU {
 	var pduList []gosnmp.SnmpPDU
-
-	// OIDの末尾番号 (IF-MIB定義)
 	// 10:InOct, 13:InDisc, 14:InErr, 16:OutOct, 19:OutDisc, 20:OutErr
 	metricOids := []int{10, 13, 14, 16, 19, 20}
 
 	for i := 1; i <= count; i++ {
 		for _, suffix := range metricOids {
-			oid := fmt.Sprintf(".1.3.6.1.2.1.2.2.1.%d.%d", suffix, i)
 			pduList = append(pduList, gosnmp.SnmpPDU{
-				Name:  oid,
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.2.2.1.%d.%d", suffix, i),
 				Type:  gosnmp.Counter32,
-				Value: uint32(1000 * i * suffix), // テスト用の適当な数値
+				Value: uint32(time.Now().Unix() % 0xFFFFFFFF),
 			})
 		}
 	}
