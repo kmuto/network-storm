@@ -2,7 +2,7 @@
 # Mackerel側の特定のサービス:ロールに存在するダミーホストを退役する
 # 環境変数MACKEREL_APIKEY付きで呼び出す
 #
-# 第1引数: サービス名。省略するとswithces
+# 第1引数: サービス名。省略するとswitches
 # 第2引数: ロール名。省略するとtokyo
 require 'json'
 
