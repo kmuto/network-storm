@@ -9,17 +9,16 @@
 
 ## delays.csv書式
 ```
-ip,median_ms,jitter_ms
-10.0.0.1,10,2
-10.0.0.2,50,10
-10.0.0.3,-1,0
+ip,median_ms,jitter_ms,loss_rate
+10.0.0.1,10,2,0
+10.0.0.2,142,134,0.29
+10.0.0.3,2201,500,0.93
 ```
 
 - `ip`: IPアドレス
 - `median_ms`: pingレスポンスの中央値（ms）
 - `jitter_ms`: `median_ms`に対するランダムな振れ幅（ms）
-
-median_msを負値にした場合はタイムアウトとして何も返さない。
+- `loss_rate`: パケットロス率
 
 ## 実行書式
 ```
