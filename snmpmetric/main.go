@@ -8,112 +8,180 @@ import (
 	"net"
 	"os"
 	"strconv"
-	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gosnmp/gosnmp"
 	"golang.org/x/net/ipv4"
 )
 
-// ulimit -n 2048
-// snmpbulkget -v2c -c public -Cn0 -Cr18 127.0.0.1:1611 .1.3.6.1.2.1.2.2.1.10
-
-// アドレスごとの設定構造体
 type AgentConfig struct {
-	IP      string
 	IfCount int
 	DelayMs int
 }
 
 func main() {
 	port := flag.Int("port", 1611, "UDP port to listen on")
-	csvPath := flag.String("csv", "config.csv", "Path to the configuration CSV file")
+	csvPath := flag.String("csv", "snmp_config.csv", "Path to the configuration CSV file")
+	ifaceName := flag.String("iface", "snmp-dummy", "Interface name to bind to")
 	flag.Parse()
 
-	configs, err := loadConfig(*csvPath)
+	// IPをキーにしたマップで設定を保持
+	configs, err := loadConfigMap(*csvPath)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	var wg sync.WaitGroup
-	for _, cfg := range configs {
-		wg.Add(1)
-		go func(cfg AgentConfig) {
-			defer wg.Done()
-			runAgent(cfg, *port)
-		}(cfg)
-	}
-
-	fmt.Printf(">> Successfully initialized %d agents on port %d\n", len(configs), *port)
-	wg.Wait()
-}
-
-func runAgent(cfg AgentConfig, port int) {
-	listenAddr := fmt.Sprintf("%s:%d", cfg.IP, port)
-	// パケットコネクションの作成
-	lc, err := net.ListenPacket("udp", listenAddr)
+	// 1. UDPコネクション作成
+	addr, _ := net.ResolveUDPAddr("udp4", fmt.Sprintf("0.0.0.0:%d", *port))
+	conn, err := net.ListenUDP("udp4", addr)
 	if err != nil {
-		log.Printf("![%s] Bind Error: %v", cfg.IP, err)
-		return
+		log.Fatalf("Listen Error: %v", err)
 	}
-	defer lc.Close()
+	defer conn.Close()
 
-	// 宛先IP取得用の設定
-	pc := ipv4.NewPacketConn(lc)
-	_ = pc.SetControlMessage(ipv4.FlagDst, true)
-	log.Printf("[%s] Active (IFs: %d, Delay: %dms)", cfg.IP, cfg.IfCount, cfg.DelayMs)
+	// 2. ソケットオプションの設定 (FileDescriptor経由)
+	file, _ := conn.File()
+	fd := int(file.Fd())
+
+	// IP_FREEBIND: 自分のインターフェースにないIP宛のバインド/受信を許可
+	syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_FREEBIND, 1)
+	// SO_BINDTODEVICE: 特定のIFに紐付け
+	syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, *ifaceName)
+	file.Close()
+
+	// 3. PacketConnに変換してDst IPを取得可能にする
+	pc := ipv4.NewPacketConn(conn)
+	pc.SetControlMessage(ipv4.FlagDst, true)
+
+	fmt.Printf(">> SNMP Simulator: listening on %s (Freebind enabled)\n", *ifaceName)
+
 	buf := make([]byte, 4096)
 	for {
 		n, cm, srcAddr, err := pc.ReadFrom(buf)
 		if err != nil {
-			log.Printf("[%s] Read error: %v", cfg.IP, err)
 			continue
 		}
 
-		// パケットデコード
+		// 宛先IPが取れない場合は無視
+		if cm == nil {
+			continue
+		}
+		dstIP := cm.Dst.String()
+
+		cfg, ok := configs[dstIP]
+		if !ok {
+			continue
+		}
+
+		// デコード以降の処理は前回と同じ
 		packet, err := gosnmp.Default.SnmpDecodePacket(buf[:n])
-		if err != nil {
-			continue
-		}
-
-		// GetBulkRequestに対する処理
-		if packet.PDUType == gosnmp.GetBulkRequest {
-			// 1. 障害シミュレーション (delay < 0)
-			if cfg.DelayMs < 0 {
-				log.Printf("[%s] DROP Request from %s (Failure Mode)", cfg.IP, srcAddr)
-				continue
-			}
-
-			// 2. 遅延シミュレーション
-			if cfg.DelayMs > 0 {
-				time.Sleep(time.Duration(cfg.DelayMs) * time.Millisecond)
-			}
-
-			// 3. レスポンス生成・送信
-			dstIP := cfg.IP
-			if cm != nil {
-				dstIP = cm.Dst.String()
-			}
-
-			response := &gosnmp.SnmpPacket{
-				Version:   packet.Version,
-				Community: packet.Community,
-				PDUType:   gosnmp.GetResponse,
-				RequestID: packet.RequestID,
-				Variables: generateIfMetrics(cfg.IfCount),
-			}
-
-			out, _ := response.MarshalMsg()
-			_, err = lc.WriteTo(out, srcAddr)
-
-			if err == nil {
-				log.Printf("[%s] SENT Response to %s", dstIP, srcAddr)
+		if err == nil {
+			if packet.PDUType == gosnmp.GetBulkRequest || packet.PDUType == gosnmp.GetNextRequest || packet.PDUType == gosnmp.GetRequest {
+				// 非同期でレスポンス処理（メインループを止めないため）
+				go handleRequest(conn, srcAddr, dstIP, packet, cfg)
 			}
 		}
 	}
 }
 
-func loadConfig(path string) ([]AgentConfig, error) {
+func handleRequest(lc net.PacketConn, srcAddr net.Addr, dstIP string, packet *gosnmp.SnmpPacket, cfg AgentConfig) {
+	// 1. 障害シミュレーション
+	if cfg.DelayMs < 0 {
+		log.Printf("[%s] DROP Request from %s", dstIP, srcAddr)
+		return
+	}
+
+	// 2. 遅延シミュレーション
+	if cfg.DelayMs > 0 {
+		time.Sleep(time.Duration(cfg.DelayMs) * time.Millisecond)
+	}
+
+	// 全データ（MIBツリー）を生成
+	allMetrics := generateIfMetrics(cfg.IfCount)
+
+	var responseVariables []gosnmp.SnmpPDU
+
+	switch packet.PDUType {
+	case gosnmp.GetBulkRequest:
+		// GetBulkの特殊パラメータ取得
+		nonRepeaters := int(packet.NonRepeaters)
+		maxRepetitions := int(packet.MaxRepetitions)
+
+		for i, v := range packet.Variables {
+			if i < nonRepeaters {
+				// Non-repeaters: 次の1つだけを返す
+				responseVariables = append(responseVariables, getNextOID(v.Name, allMetrics, 1)...)
+			} else {
+				// Repeaters: Max-repetitions 分だけ次々と返す
+				responseVariables = append(responseVariables, getNextOID(v.Name, allMetrics, maxRepetitions)...)
+			}
+		}
+	case gosnmp.GetNextRequest:
+		// GetNext: 各変数の「次の1つ」を返す
+		for _, v := range packet.Variables {
+			responseVariables = append(responseVariables, getNextOID(v.Name, allMetrics, 1)...)
+		}
+	default:
+		// GetRequest: そのものズバリを返す（今回は簡易的に全検索）
+		for _, v := range packet.Variables {
+			for _, m := range allMetrics {
+				if m.Name == v.Name {
+					responseVariables = append(responseVariables, m)
+					break
+				}
+			}
+		}
+	}
+
+	// レスポンス送信
+	response := &gosnmp.SnmpPacket{
+		Version:   packet.Version,
+		Community: packet.Community,
+		PDUType:   gosnmp.GetResponse,
+		RequestID: packet.RequestID,
+		Variables: responseVariables,
+	}
+
+	out, err := response.MarshalMsg()
+	if err != nil {
+		return
+	}
+
+	_, err = lc.WriteTo(out, srcAddr)
+	if err == nil {
+		log.Printf("[%s] SENT Response to %s (IFs: %d)", dstIP, srcAddr, cfg.IfCount)
+	}
+}
+
+// 指定されたOIDより「後ろ」にあるOIDをcount個分返す関数
+func getNextOID(requestedOID string, allMetrics []gosnmp.SnmpPDU, count int) []gosnmp.SnmpPDU {
+	var results []gosnmp.SnmpPDU
+	foundCount := 0
+
+	for _, m := range allMetrics {
+		// OIDの文字列比較（簡易版）。本来は数値配列での比較が正確ですが
+		// 今回の固定OID構造なら文字列辞書順でも概ね動作します。
+		if m.Name > requestedOID {
+			results = append(results, m)
+			foundCount++
+			if foundCount >= count {
+				break
+			}
+		}
+	}
+
+	// もし次が何もなければ EndOfMibView を入れるのがマナー
+	if len(results) == 0 {
+		results = append(results, gosnmp.SnmpPDU{
+			Name: requestedOID,
+			Type: gosnmp.EndOfMibView,
+		})
+	}
+	return results
+}
+
+func loadConfigMap(path string) (map[string]AgentConfig, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -126,33 +194,40 @@ func loadConfig(path string) ([]AgentConfig, error) {
 		return nil, err
 	}
 
-	var configs []AgentConfig
+	configs := make(map[string]AgentConfig)
 	for i, r := range records {
-		if i == 0 || len(r) < 3 { // ヘッダー飛ばし & 列数チェック
+		if i == 0 || len(r) < 3 {
 			continue
 		}
-
 		ifCnt, _ := strconv.Atoi(r[1])
 		delay, _ := strconv.Atoi(r[2])
-
-		configs = append(configs, AgentConfig{
-			IP: r[0], IfCount: ifCnt, DelayMs: delay,
-		})
+		configs[r[0]] = AgentConfig{IfCount: ifCnt, DelayMs: delay}
 	}
 	return configs, nil
 }
 
 func generateIfMetrics(count int) []gosnmp.SnmpPDU {
 	var pduList []gosnmp.SnmpPDU
-	// 10:InOct, 13:InDisc, 14:InErr, 16:OutOct, 19:OutDisc, 20:OutErr
-	metricOids := []int{10, 13, 14, 16, 19, 20}
+	metricOids := []int{10, 13, 14, 16, 19, 20} // ifInOctets, ifInDiscards, ifInErrors, ifOutOctets, ifOutDiscards, ifOutErrors
+	now := uint32(time.Now().Unix() % 0xFFFFFFFF)
 
 	for i := 1; i <= count; i++ {
 		for _, suffix := range metricOids {
 			pduList = append(pduList, gosnmp.SnmpPDU{
 				Name:  fmt.Sprintf(".1.3.6.1.2.1.2.2.1.%d.%d", suffix, i),
 				Type:  gosnmp.Counter32,
-				Value: uint32(time.Now().Unix() % 0xFFFFFFFF),
+				Value: now,
+			})
+		}
+	}
+	metricOids = []int{6, 10} // ifHCInOctets, ifHCOutOctets
+
+	for i := 1; i <= count; i++ {
+		for _, suffix := range metricOids {
+			pduList = append(pduList, gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.31.1.1.1.%d.%d", suffix, i),
+				Type:  gosnmp.Counter32,
+				Value: now,
 			})
 		}
 	}
