@@ -118,13 +118,29 @@ func handleRequest(pc *ipv4.PacketConn, srcAddr net.Addr, dstIP string, packet *
 		nonRepeaters := int(packet.NonRepeaters)
 		maxRepetitions := int(packet.MaxRepetitions)
 
-		for i, v := range packet.Variables {
-			if i < nonRepeaters {
-				// Non-repeaters: 次の1つだけを返す
-				responseVariables = append(responseVariables, getNextOID(v.Name, allMetrics, 1)...)
-			} else {
-				// Repeaters: Max-repetitions 分だけ次々と返す
-				responseVariables = append(responseVariables, getNextOID(v.Name, allMetrics, maxRepetitions)...)
+		// 1. Non-repeaters の処理（これはそのまま）
+		for i := 0; i < nonRepeaters && i < len(packet.Variables); i++ {
+			responseVariables = append(responseVariables, getNextOID(packet.Variables[i].Name, allMetrics, 1)...)
+		}
+
+		// 2. Repeaters の処理（ここを「交互」にする）
+		if len(packet.Variables) > nonRepeaters {
+			repeaters := packet.Variables[nonRepeaters:]
+			for r := 0; r < maxRepetitions; r++ {
+				for _, v := range repeaters {
+					// 各リピーターの「r番目の次」を1つずつ順番に入れる
+					// 注意: getNextOID(v.Name, allMetrics, r+1) の「最後の1つ」を取る工夫が必要
+					nexts := getNextOID(v.Name, allMetrics, r+1)
+					if len(nexts) > r {
+						responseVariables = append(responseVariables, nexts[r])
+					} else {
+						// データがない場合は EndOfMibView
+						responseVariables = append(responseVariables, gosnmp.SnmpPDU{
+							Name: v.Name,
+							Type: gosnmp.EndOfMibView,
+						})
+					}
+				}
 			}
 		}
 	case gosnmp.GetNextRequest:
@@ -166,10 +182,6 @@ func handleRequest(pc *ipv4.PacketConn, srcAddr net.Addr, dstIP string, packet *
 		RequestID: packet.RequestID,
 		Variables: responseVariables,
 	}
-
-	sort.Slice(response.Variables, func(i, j int) bool {
-		return compareOIDs(response.Variables[i].Name, response.Variables[j].Name)
-	})
 
 	out, err := response.MarshalMsg()
 	if err != nil {
