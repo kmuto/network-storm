@@ -10,7 +10,6 @@ require 'csv'
 
 FILE_NAME = ARGV[0]
 TOTAL_HOSTS = ARGV[1] ? ARGV[1].to_i : 1000
-TIMEOUT_CHANCE = ARGV[2] ? ARGV[2].to_f : 0.05
 START_INDEX = ARGV[3] ? ARGV[3].to_i : 0
 
 unless FILE_NAME
@@ -19,7 +18,7 @@ unless FILE_NAME
 end
 
 CSV.open(FILE_NAME, "wb") do |csv|
-  csv << ["ip", "median_ms", "jitter_ms"]
+  csv << ["ip", "median_ms", "jitter_ms", "loss_rate"]
 
   (START_INDEX...(START_INDEX + TOTAL_HOSTS)).each do |i|
     # 通算インデックス i から IPアドレスを計算
@@ -35,18 +34,19 @@ CSV.open(FILE_NAME, "wb") do |csv|
 
     ip = "10.0.#{octet3}.#{octet4}"
 
-    # 数値生成ロジック
-    if rand < TIMEOUT_CHANCE
-      median, jitter = -1, 0
-    else
-      case rand
-      when 0..0.8   then median, jitter = rand(5..50), rand(1..10)
-      when 0.8..0.95 then median, jitter = rand(100..500), rand(20..100)
-      else               median, jitter = rand(1000..3000), rand(200..800)
-      end
+    # ネットワーク状態のシミュレーション
+    case rand
+    when 0..0.8 # 正常: 低遅延・ロスなし
+      median, jitter, loss = rand(5..30), rand(1..5), 0.0
+    when 0.8..0.9 # 不安定: 中遅延・時々ロス
+      median, jitter, loss = rand(100..300), rand(50..150), rand(0.01..0.05).round(3)
+    when 0.9..0.97 # 輻輳: 高遅延・高いロス
+      median, jitter, loss = rand(500..1500), rand(200..500), rand(0.1..0.3).round(3)
+    else # 障害: ほぼ届かない
+      median, jitter, loss = rand(2000..3000), 500, rand(0.8..1.0).round(3)
     end
 
-    csv << [ip, median, jitter]
+    csv << [ip, median, jitter, loss]
   end
 end
 
