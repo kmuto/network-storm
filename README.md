@@ -6,8 +6,7 @@
 ## ping・snmpstormで共存するための設定
 実際のインターフェイスは作らず、ダミーインターフェイスで返答するようにする。
 
-10.0.0.0ネットワーク決めうちにしている。
-
+以下は10.0.0.0/20ネットワークを作った例。
 
 ```
 sudo ip link add snmp-dummy type dummy
@@ -18,11 +17,11 @@ sudo sysctl -w net.ipv4.icmp_echo_ignore_all=1
 ```
 
 ## 設定ファイルの作成
-- `create_ip_and_delays.rb`: `sim_ping.py`や設定ファイル作成ツール向けのCSV生成。10.0.0.0ネットワーク決めうちにしている。生成したCSVファイルを`sim_ping.py`に指定する
+- `create_ip_and_delays.rb`: `sim_ping.py`や設定ファイル作成ツール向けのCSV生成。生成したCSVファイルを`sim_ping.py`に指定する
   - 第1引数: 生成するCSVファイル名
   - 第2引数: IPアドレス数。省略すると1000
-  - 第3引数: タイムアウトのホストの頻度。省略すると0.05 (5%)
-  - 第4引数: 何番目から開始するか (※ホストを追加したくなったとき用)
+  - 第3引数: 先頭IPアドレス2オクテット。省略すると10.0
+  - 第4引数: 何番目から開始するか
 - `create_mackerel_hosts.rb`: Mackerelホストの生成
   - 第1引数: IPアドレス一覧のCSVファイル名 (`create_ip_and_delays.rb`で生成したCSV)
   - 第2引数: 所属する「サービス:ロール」の文字列。省略すると`switches:tokyo`
