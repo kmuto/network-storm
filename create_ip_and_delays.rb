@@ -4,12 +4,13 @@
 #
 # 第1引数: 生成するCSVファイル名
 # 第2引数: IPアドレス数。省略すると1000
-# 第3引数: タイムアウトのホストの頻度。省略すると0.05 (5%)
+# 第3引数: 先頭IPアドレス2オクテット。省略すると10.0
 # 第4引数: 何番目から開始するか
 require 'csv'
 
 FILE_NAME = ARGV[0]
 TOTAL_HOSTS = ARGV[1] ? ARGV[1].to_i : 1000
+START_IP = ARGV[2] ? ARGV[2] : '10.0'
 START_INDEX = ARGV[3] ? ARGV[3].to_i : 0
 
 unless FILE_NAME
@@ -28,11 +29,11 @@ CSV.open(FILE_NAME, "wb") do |csv|
 
     # 10.0.255.x を超える場合のガード（必要であれば）
     if octet3 > 254
-      puts "Warning: IPアドレスの範囲(10.0.254.254)を超えました。中断します。"
+      puts "Warning: IPアドレスの範囲(#{START_IP}.254.254)を超えました。中断します。"
       break
     end
 
-    ip = "10.0.#{octet3}.#{octet4}"
+    ip = "#{START_IP}.#{octet3}.#{octet4}"
 
     # ネットワーク状態のシミュレーション
     case rand
