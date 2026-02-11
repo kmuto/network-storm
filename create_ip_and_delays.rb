@@ -47,6 +47,12 @@ CSV.open(FILE_NAME, "wb") do |csv|
       median, jitter, loss = rand(2000..3000), 500, rand(0.8..1.0).round(3)
     end
 
+    if ENV['IDEAL']
+      median = 0
+      jitter = 0
+      loss = 0
+    end
+
     csv << [ip, median, jitter, loss]
   end
 end
