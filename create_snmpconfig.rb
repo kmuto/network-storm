@@ -38,6 +38,11 @@ CSV.open(SNMP_CSV, "wb") do |csv|
                  [ping_median.to_i, 1].max
                end
 
+    if ENV['IDEAL']
+      if_count = 9
+      delay_ms = 0
+    end
+
     csv << [ip, if_count, delay_ms]
     
     # 統計用

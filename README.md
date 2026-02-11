@@ -42,3 +42,16 @@ sudo sysctl -w net.ipv4.icmp_echo_ignore_all=1
   - 第2引数: サービス名。省略すると`switches`
   - 第3引数: ロール名。省略すると`tokyo`
   - `MACKEREL_APIKEY`環境変数付きで実行すること
+
+## 応答側の例
+- 10.0.0.0/20ネットワークを仮想利用
+- `create_ip_and_delays.rb`で`ip.csv`を作成
+- `create_snmpconfig.rb`で`snmpstorm.csv`を作成
+- 物理インターフェイスはenp0s3
+
+```
+sudo python3 sim_ping.py --iface enp0s3 --net 10.0.0.0/20 --csv ip.csv
+./snmpstorm -csv snmpstorm.csv -iface enp0s3
+```
+
+## 送信側の例

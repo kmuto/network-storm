@@ -28,13 +28,20 @@ File.open(OUTPUT_FILE, 'w') do |f|
   f.puts "x-api-key: #{ENV['MACKEREL_APIKEY']}"
   f.puts 'collector:'
 
+  c = 1
   CSV.foreach(CSV_FILE, headers: true) do |row|
     ip = row['ip']
 
     # テキストの書き出し
     f.puts "- host: #{ip}"
-    f.puts "  custom-identifier: sw#{ip}"
+    if ENV['DUMMY']
+      f.puts "  host-id: #{sprintf('s%010d', c)}"
+    else
+      f.puts "  custom-identifier: sw#{ip}"
+    end
     f.puts '  average: true'
+
+    c += 1
   end
 end
 
